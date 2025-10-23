@@ -165,10 +165,11 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline){
 
-    char* argv[MAXLINE];
-    char buffer[MAXLINE];
-    strcpy(buffer, cmdline);
-    int bg  = parseline(buffer, argv);
+    char* argv[MAXARGS];
+    //char cmdL_buf[MAXLINE];    //Following suite as parseline & creating local copy of cmdline
+    //strcpy(cmdL_buf, cmdline);
+
+    int bg  = parseline(cmdline, argv);
     
     if (argv[0] == NULL){ // Ignore empty lines
         return;    
@@ -179,7 +180,7 @@ void eval(char *cmdline){
         return;
     }
     
-    // Block all interrupt signals while forking
+    // Block all interrupt signals before forking
     sigset_t mask, prev_mask;
     sigemptyset(&mask);         // Clear the mask first
     sigaddset(&mask, SIGCHLD);  // Child status change
@@ -187,39 +188,40 @@ void eval(char *cmdline){
     sigaddset(&mask, SIGTSTP);  // Terminal stop signal
     sigprocmask(SIG_BLOCK, &mask, &prev_mask);
 
-    pid_t chld_pid = Fork(); // Create and save child pid
-    if (!chld_pid){          // IF we are the child... (child's pid == 0)
-        setpgrid(chld_pid, 0);  // Set new process group
+    pid_t chld_pid = Fork();   // Create fork and save child pid
+    if (!chld_pid){            // IF we are the child... (child's pid == 0)
+        setpgid(0, 0);         // Set new process group
+        
+        // Restore mask (removing blocks placed above)
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL); 
+
+        // Try and Execute the command (save return value):
+        int execve_err = execve(argv[0], argv, environ); 
+
+        //If command was not able to execute, exit child process:
+        if (execve_err < 0){
+            printf("%s Command not found.\n", argv[0]);
+            exit(0);
+        }
+    }
+
+    
+    if (bg){
+        // Adding background job and restoring signal mask for parent.
+        addjob(jobs, chld_pid, BG, cmdline);
         sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-
-        int execve_err = execve(argv[0], argv, environ);
-    }
-    
-
-
-   
-
-    /*
-    if (builtin_cmd(argv)){
-        return;
+    } 
+    else{
+        // Add to foreground if NOT a background task and restoring mask for parent
+        addjob(jobs, chld_pid, FG, cmdline);
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        waitfg(chld_pid);
     }
 
-    sigset_t mask_all, mask_one, prev_one;
-    sigemptyset(&mask_one);
-    sigaddset(&mask_one, SIGCHLD);
-    sigemptyset(&mask_all);
-    sigaddset(&mask_all, SIGCHLD);
-
-    pid_t pid;
-    */
-
-    // Block all signals while creating job
-   
-
-
-    
     return;
-}
+}  
+
+
 
 /* 
  * parseline - Parse the command line and build the argv array.
@@ -380,6 +382,10 @@ void do_bgfg(char **argv) {
  */
 void waitfg(pid_t pid)
 {
+    //While pid is a foreground job, keep looping. If pid doesn't exist it just returns anyways
+    while(pid == fgpid(jobs)){
+        sleep(1);
+    } 
     return;
 }
 
@@ -396,6 +402,47 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    int old_errno = errno;
+    int status;
+    pid_t pid;
+
+    while (1){
+        pid = waitpid(-1, &status, WNOHANG | WUNTRACED);
+
+        if (pid > 0){
+            struct job_t *job = getjobpid(jobs, pid);
+            // Probably would not happen but just in case
+            if (job == NULL){ continue; } 
+        
+            if (WISTOPPED(status)){
+                //Child stopped - Mark as ST and report
+                job->state = ST;
+                printf("Job [%d] (%d) stopped by signal %d\n", job->jid, job->pid, WSTOPSIG(status));
+            }
+            else if (WIFSIGNALED(status)){
+                // Child terminated due to uncaught signal
+                printf("Job [%d] (%d) terminated by signal %d\n", job->jid, job->pid, WTERMSIG(status));
+                deletejob(jobs, pid);
+            }
+            else if (WIFEXITED(status)){
+                // Child exited normally. No need for message
+                deletejob(jobs, pid);
+            }
+            
+        }
+        // No more children have state changes to report now
+        else if (pid == 0){
+            break;
+        }
+        else{ // PID < 0
+            if (errno == ECHILD){
+                // No Children to reap.
+                break;
+            }
+        }
+    }
+
+    errno = old_errno;
     return;
 }
 
